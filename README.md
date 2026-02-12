@@ -22,7 +22,7 @@
 &emsp;&emsp;&emsp;创建数据库<br>
 &emsp;&emsp;&emsp;&emsp;```docker exec -it mysql mysql -uroot -proot123 -e "CREATE DATABASE IF NOT EXISTS video_processing;"```<br>
 &emsp;&emsp;&emsp;启动程序<br>
-&emsp;&emsp;&emsp;&emsp;```python app/main.py```<br>
+&emsp;&emsp;&emsp;&emsp;```python app.py```<br>
 &emsp;&emsp;&emsp;MinIO 控制台 http://localhost:9001 (admin/admin123)<br>
 &emsp;6、查看mysql数据<br>
 &emsp;&emsp;&emsp;```docker exec -it mysql mysql -uroot -proot123```<br>
@@ -52,7 +52,7 @@
 &emsp;4、根据修改后的文字时间戳来剪辑视频，并修改视频播放速度<br>
 &emsp;&emsp;edit_video1.py<br>
 &emsp;5、启动端口<br>
-&emsp;&emsp;app/main.py<br>
+&emsp;&emsp;app.py<br>
 
 **[技术心得]**<br>
 &emsp;1、识别需要剪辑的文本段采用了滑动窗口的方法，设定了两套识别规则，触发任意一条则判定为剪辑指令：规则一、如果关键词之后的两个字符在前文复现；规则二、如果关键词之后的三个字符在前文复现出两个字符位置和内容一致；<br>
