@@ -1,367 +1,243 @@
-"""
-第一阶段：传统方法裁剪时间戳文本
-功能：
-1. 读取 timestamps.txt 和演讲稿文本.txt
-2. 识别所有"重来"指令（连续挨着的取最后一个）
-3. 计算每个指令对应的删除区间
-4. 从时间戳文本中抹掉这些区间
-5. 输出 timestamps_1.txt 和 演讲稿文本1.txt
-"""
-
 import os
-import re
+from openai import OpenAI
+
+os.environ["OPENAI_API_KEY"] = "sk-PPuZAgTDe40Ek9Yy34D010EcDb6f4760A6Bc4bDc3628B09b"
+client = OpenAI(
+    base_url="https://chat.9000aigc.com/v1"
+)
+
+# 你的剪辑规则提示词
+system_prompt = """
+你现在的任务是对一段未经整理的演讲口语转写稿进行剪辑处理。
+
+这是连续的线性文本。文本中包含多次"讲一段 → 否定 → 重讲"的结构。
+
+严格处理规则：
+
+只允许删除文本，禁止修改、润色、替换或重写任何保留内容。
+
+将文本按时间顺序理解为多个"表达版本块"：
+每一次连续讲述的内容，直到出现否定信号为止，视为一个完整版本块。
+
+当出现否定或重录信号时，必须删除：
+最近一次完整的表达版本块 + 该否定语句本身。
+
+否定信号包括但不限于：
+"重来""再重来""不对""讲错了""这句没讲好""卡住了""算了重来""我要换个讲法""太枯燥""太技术""听不懂""没必要讲这个"等。
+
+如果连续出现多个否定信号，视为对同一版本块的重复否定。
+
+只保留最后一次未被否定的完整表达版本。
+
+不做任何语义优化或逻辑重组。
+
+输出最终清理后的完整文本，不添加解释或说明。
+"""
+
+# 文件路径配置
+txt_file_path = "演讲稿文本.txt"
+timestamps_file_path = "timestamps.txt"
+output_txt_path = "演讲稿文本1.txt"
+output_timestamps_path = "timestamps_1.txt"
 
 
-def parse_timestamps(txt_path):
-    """解析时间戳文件"""
-    with open(txt_path, 'r', encoding='utf-8') as f:
+def parse_timestamps(filepath):
+    """
+    解析时间戳文件，返回：
+    - chars: 按顺序排列的所有字符列表
+    - char_to_line: 每个字符索引对应的行索引
+    - lines: 原始时间戳行列表
+    """
+    with open(filepath, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    words = []
+    all_lines = []
+    chars = []
+    char_to_line = []  # 字符索引 -> 行索引
+
     for line_idx, line in enumerate(lines):
         line = line.strip()
-        if not line or line.startswith('='):
+        if not line or line.startswith("="):
             continue
 
-        match = re.match(r'\[([\d.]+)s - ([\d.]+)s\]\s*(.+)', line)
-        if match:
-            start = float(match.group(1))
-            end = float(match.group(2))
-            word = match.group(3)
-            words.append({
-                'word': word,
-                'start': start,
-                'end': end,
-                'line_index': line_idx
-            })
+        if line.startswith("[") and "] " in line:
+            all_lines.append(line)
+            content = line.split("] ", 1)[1]
+            for char in content:
+                if char.strip():
+                    chars.append(char)
+                    char_to_line.append(len(all_lines) - 1)  # 记录这行是第几行
 
-    return lines, words
+    return chars, char_to_line, all_lines
 
 
-def parse_script(script_path):
-    """读取演讲稿文本"""
-    if not os.path.exists(script_path):
-        return None
-    with open(script_path, 'r', encoding='utf-8') as f:
-        return f.read()
-
-
-def find_chonglai_groups(words):
+def sliding_window_match(cleaned_chars, timestamps_chars):
     """
-    找出所有"重来"的位置，并合并连续的"重来"
-
-    例如：如果有"重来重来重来"，算作一组，处理最后一个
-
-    Returns:
-        chonglai_groups: 每组"重来"的信息，{'index': n, 'start_idx':, 'end_idx':}
+    滑动窗口匹配法：
+    - cleaned_chars: GPT清理后的字符列表
+    - timestamps_chars: 时间戳中的原始字符列表
+    返回：要保留的 timestamps 字符索引列表
     """
-    chonglai_groups = []
-    group_index = 0
-    i = 0
+    if len(cleaned_chars) == 0:
+        return []
 
-    while i < len(words) - 1:
-        if words[i]['word'] == '重' and words[i + 1]['word'] == '来':
-            # 找到一个"重来"，继续往后检查是否还有连续的
-            group_start = i
-            j = i
+    result = []  # 保留的 timestamps 索引
+    i = 0  # cleaned 指针
+    j = 0  # timestamps 指针
 
-            # 跳过连续的"重来"
-            while j < len(words) - 1 and words[j]['word'] == '重' and words[j + 1]['word'] == '来':
-                j += 2  # 跳过"重来"两个字
+    while i < len(cleaned_chars):
+        # 尝试在 timestamps[j:] 中找到 cleaned[i:] 能匹配的位置
+        best_match_pos = -1
+        best_match_len = 0
 
-            group_end = j - 2  # 最后一个"重来"的"重"字位置
-            last_lai_idx = group_end + 1  # 最后一个"重来"的"来"字位置
+        # 限制搜索范围
+        search_limit = min(j + 500, len(timestamps_chars))
 
-            group_index += 1
-            chonglai_groups.append({
-                'index': group_index,
-                'start_idx': group_start,     # 第一个"重来"的"重"字索引
-                'end_idx': last_lai_idx,      # 最后一个"重来"的"来"字索引
-                'start_time': words[group_start]['start'],
-                'end_time': words[last_lai_idx]['end']
-            })
+        for pos in range(j, search_limit):
+            # 检查 cleaned[i:] 是否能在 timestamps[pos:] 中完全匹配
+            match_len = 0
+            max_check = min(len(cleaned_chars) - i, len(timestamps_chars) - pos, 100)
 
-            i = j
+            for k in range(max_check):
+                if cleaned_chars[i + k] == timestamps_chars[pos + k]:
+                    match_len += 1
+                else:
+                    break
+
+            if match_len > best_match_len:
+                best_match_len = match_len
+                best_match_pos = pos
+
+            if best_match_len == len(cleaned_chars) - i:
+                break
+
+        if best_match_pos > j and best_match_len > 0:
+            # 找到更好的匹配位置，跳过中间的 timestamps 字符（删除）
+            j = best_match_pos
+
+        # 现在 timestamps[j] 应该匹配 cleaned[i]
+        if j < len(timestamps_chars) and timestamps_chars[j] == cleaned_chars[i]:
+            result.append(j)
+            i += 1
+            j += 1
         else:
+            print(f"警告: cleaned[{i}]='{cleaned_chars[i]}' 在 timestamps 中找不到匹配")
             i += 1
 
-    return chonglai_groups
+    return result
 
 
-def is_instruction(chonglai_group, words, prev_group_end_idx=None):
+def build_cleaned_timestamp_lines(kept_indices, char_to_line, original_lines):
     """
-    判断某个"重来"组是否是剪辑指令
-
-    规则1：取"重来"后面2个字，往前找（精确匹配）
-    规则2：取"重来"后面3个字，往前找（滑动窗口，2个以上连续匹配）
-    优先匹配3个字，再匹配2个字
-
-    Args:
-        chonglai_group: "重来"组信息
-        words: 字列表
-        prev_group_end_idx: 前一个"重来"组的结束索引（用于限定搜索范围）
-
-    Returns:
-        (bool, match_idx, match_info): (是否指令, 匹配位置, 匹配信息)
+    根据保留的字符索引，构建清理后的时间戳行
+    - kept_indices: 保留的字符在 timestamps 中的索引
+    - char_to_line: 每个字符索引对应的行索引
+    - original_lines: 原始时间戳行列表
     """
-    last_lai_idx = chonglai_group['end_idx']  # 最后一个"重来"的"来"字索引
+    # 找出需要保留的行索引（去重，保持顺序）
+    kept_lines_set = set()
+    for char_idx in kept_indices:
+        if char_idx < len(char_to_line):
+            kept_lines_set.add(char_to_line[char_idx])
 
-    # 确定往前找的范围
-    search_start = last_lai_idx - 1
-    search_end = (prev_group_end_idx + 1) if prev_group_end_idx is not None else 0
-
-    # 先尝试规则2（3个字，滑动窗口）
-    if last_lai_idx + 3 < len(words):
-        target_words = [words[last_lai_idx + 1]['word'], words[last_lai_idx + 2]['word'], words[last_lai_idx + 3]['word']]
-
-        # 滑动窗口查找
-        # 窗口左边界从 search_start 开始，右边界是 last_lai_idx - 1
-        left = search_start
-        while left >= search_end:
-            # 窗口内的3个字
-            window_words = [words[left]['word'], words[left + 1]['word'], words[left + 2]['word']]
-
-            # 统计匹配情况：内容相同 AND 位置相同
-            match_count = 0
-            for i in range(3):
-                if window_words[i] == target_words[i]:
-                    match_count += 1
-
-            # 如果有2个以上（含）匹配
-            if match_count >= 2:
-                match_detail = {
-                    'matched_words': ''.join(target_words),
-                    'match_count': match_count
-                }
-                return True, left, match_detail
-
-            # 窗口左移1位
-            left -= 1
-
-    # 再尝试规则1（2个字，精确匹配）
-    if last_lai_idx + 2 < len(words):
-        word_a = words[last_lai_idx + 1]['word']
-        word_b = words[last_lai_idx + 2]['word']
-
-        for i in range(search_start, search_end - 1, -1):
-            if i + 1 < len(words):
-                if words[i]['word'] == word_a and words[i + 1]['word'] == word_b:
-                    match_detail = {
-                        'matched_words': f"{word_a}{word_b}",
-                        'match_count': 2
-                    }
-                    return True, i, match_detail
-
-    return False, None, None
+    kept_lines = sorted(kept_lines_set)
+    return [original_lines[line_idx] for line_idx in kept_lines]
 
 
-def cut_timestamps(words, instruction_ranges):
-    """
-    根据指令区间裁剪时间戳
+def save_output_files(cleaned_text, cleaned_timestamps):
+    # 保存演讲稿文本1.txt
+    with open(output_txt_path, "w", encoding="utf-8") as f:
+        f.write(cleaned_text)
+    print(f"已保存: {output_txt_path}")
 
-    Args:
-        words: 字列表
-        instruction_ranges: 指令区间列表 [{'start_idx':, 'end_idx':, 'start_time':, 'end_time':}]
+    # 保存时间戳1.txt
+    header = "==================================================\n说话内容时间戳\n==================================================\n"
+    content = header + "\n".join(cleaned_timestamps) + "\n"
 
-    Returns:
-        remaining_words: 保留的字列表
-    """
-    if not instruction_ranges:
-        return words[:], []
-
-    # 按 start_idx 从大到小排序，这样删除时不会影响前面的索引
-    sorted_ranges = sorted(instruction_ranges, key=lambda x: x['start_idx'], reverse=True)
-
-    # 标记要删除的索引
-    to_remove = set()
-    removed_info = []
-
-    for r in sorted_ranges:
-        # 删除从 start_idx 到 end_idx 的所有字
-        for idx in range(r['start_idx'], r['end_idx'] + 1):
-            if idx < len(words):
-                to_remove.add(idx)
-        removed_info.append({
-            'word_a': words[r['start_idx'] - 2]['word'] if r['start_idx'] >= 2 else '',
-            'word_b': words[r['start_idx'] - 1]['word'] if r['start_idx'] >= 1 else '',
-            'start_time': r['start_time'],
-            'end_time': r['end_time']
-        })
-
-    # 保留不在删除集合中的字
-    remaining_words = [w for idx, w in enumerate(words) if idx not in to_remove]
-
-    return remaining_words, removed_info
-
-
-def assemble_script(words):
-    """把离散的字拼成连续的演讲稿"""
-    return ''.join(w['word'] for w in words)
-
-
-def generate_marked_script(words, instruction_ranges):
-    """
-    生成标记后的演讲稿
-    被删除的部分用【删除：xxx...xxx】标注
-    """
-    if not instruction_ranges:
-        return assemble_script(words)
-
-    # 按索引从大到小排序
-    sorted_ranges = sorted(instruction_ranges, key=lambda x: x['start_idx'], reverse=True)
-
-    # 标记要删除的部分
-    script_chars = []
-    current_idx = 0
-
-    for r in sorted_ranges:
-        # 添加删除区间前面的字
-        for i in range(current_idx, r['start_idx']):
-            script_chars.append(words[i]['word'])
-
-        # 获取被删除的内容
-        deleted_content = ''.join(words[i]['word'] for i in range(r['start_idx'], r['end_idx'] + 1))
-        script_chars.append(f"【删除：{deleted_content}】")
-
-        current_idx = r['end_idx'] + 1
-
-    # 添加剩余的字
-    for i in range(current_idx, len(words)):
-        script_chars.append(words[i]['word'])
-
-    return ''.join(script_chars)
-
-
-def phase1_process(timestamps_path, script_path, output_prefix='1'):
-    """
-    第一阶段处理
-
-    Args:
-        timestamps_path: 时间戳文件路径
-        script_path: 演讲稿文件路径
-        output_prefix: 输出文件序号（如 '1'）
-
-    Returns:
-        instruction_ranges: 识别出的指令区间
-    """
-    print("=" * 50)
-    print("第一阶段：传统方法裁剪")
-    print("=" * 50)
-
-    # 1. 读取文件
-    print("\n[1/5] 正在读取文件...")
-    lines, words = parse_timestamps(timestamps_path)
-    original_script = parse_script(script_path)
-    print(f"      时间戳：{len(words)} 个字")
-    print(f"      演讲稿：{len(original_script)} 个字符")
-
-    # 2. 找出所有"重来"组
-    print("\n[2/5] 正在查找'重来'...")
-    chonglai_groups = find_chonglai_groups(words)
-    print(f"      共有 {len(chonglai_groups)} 个'重来'组")
-
-    # 3. 判断每个组是否是剪辑指令
-    print("\n[3/5] 正在分析剪辑指令...")
-    instruction_ranges = []
-    prev_end_idx = None
-
-    for i, group in enumerate(chonglai_groups):
-        is_inst, match_idx, match_info = is_instruction(group, words, prev_end_idx)
-
-        if is_inst:
-            match_words = match_info['matched_words']
-            num_chars = len(match_words)
-
-            instruction_ranges.append({
-                'index': group['index'],
-                'start_idx': match_idx,       # 滑动窗口左边界（要删除的起点）
-                'end_idx': group['end_idx'],   # 最后那个"重来"的"来"字索引
-                'start_time': words[match_idx]['start'],
-                'end_time': group['end_time'],
-                'match_words': match_words,
-                'num_chars': num_chars
-            })
-            print(f"      [重来{group['index']}] -> 是指令（匹配{num_chars}字），删除区间 [{words[match_idx]['start']:.2f}s - {group['end_time']:.2f}s]")
-            print(f"             匹配：'{match_words}'")
-
-            prev_end_idx = group['end_idx']
-        else:
-            print(f"      [重来{group['index']}] -> 不是指令（演讲内容）")
-
-    print(f"\n      共识别到 {len(instruction_ranges)} 个剪辑指令")
-
-    # 4. 裁剪时间戳
-    print("\n[4/5] 正在裁剪时间戳...")
-    remaining_words, removed_info = cut_timestamps(words, instruction_ranges)
-    print(f"      原始：{len(words)} 字 -> 裁剪后：{remaining_words} 字")
-
-    # 5. 生成输出文件
-    print("\n[5/5] 正在生成输出文件...")
-
-    # 生成 timestamps_1.txt
-    timestamps_1_path = f"timestamps_{output_prefix}.txt"
-    with open(timestamps_1_path, 'w', encoding='utf-8') as f:
-        f.write("=" * 50 + "\n")
-        f.write(f"时间戳文本（第一阶段裁剪后）\n")
-        f.write("=" * 50 + "\n\n")
-        for w in remaining_words:
-            f.write(f"[{w['start']:.2f}s - {w['end']:.2f}s] {w['word']}\n")
-    print(f"      -> {timestamps_1_path}")
-
-    # 生成 演讲稿文本1.txt（基于 timestamps_1.txt 的内容整理）
-    script_1_path = f"演讲稿文本{output_prefix}.txt"
-    clean_script = assemble_script(remaining_words)
-    with open(script_1_path, 'w', encoding='utf-8') as f:
-        f.write("=" * 50 + "\n")
-        f.write(f"演讲稿文本（第一阶段裁剪后）\n")
-        f.write("=" * 50 + "\n\n")
-        f.write(clean_script + "\n")
-    print(f"      -> {script_1_path}")
-
-    # 生成 cut_segments.txt（被剪去的时间段，供 edit_video.py 使用）
-    cut_segments_path = "cut_segments.txt"
-    with open(cut_segments_path, 'w', encoding='utf-8') as f:
-        f.write("=" * 50 + "\n")
-        f.write(f"被剪去的时间段\n")
-        f.write("=" * 50 + "\n\n")
-        for r in instruction_ranges:
-            f.write(f"[{r['start_time']:.2f}s - {r['end_time']:.2f}s]\n")
-    print(f"      -> {cut_segments_path}")
-
-    # 打印被删除的内容
-    print("\n----- 被删除的内容 -----")
-    for r in instruction_ranges:
-        print(f"  [{r['start_time']:.2f}s - {r['end_time']:.2f}s]: 匹配'{r['match_words']}'")
-    print("-" * 50)
-
-    return instruction_ranges
+    with open(output_timestamps_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"已保存: {output_timestamps_path}")
 
 
 def main():
-    """运行第一阶段处理"""
-    # 配置
-    TIMESTAMPS_TXT = r"F:\pycharm\pycharm\视频剪辑\timestamps.txt"
-    SCRIPT_TXT = r"F:\pycharm\pycharm\视频剪辑\演讲稿文本.txt"
+    # 1. 解析时间戳文件
+    timestamps_chars, char_to_line, timestamp_lines = parse_timestamps(timestamps_file_path)
+    print(f"时间戳字符数: {len(timestamps_chars)}")
+    print(f"时间戳行数: {len(timestamp_lines)}")
 
-    # 如果没有演讲稿文本.txt，从 timestamps.txt 生成
-    if not os.path.exists(SCRIPT_TXT):
-        print("\n未找到 演讲稿文本.txt，正在从 timestamps.txt 生成...")
-        lines, words = parse_timestamps(TIMESTAMPS_TXT)
-        script_content = assemble_script(words)
-        with open(SCRIPT_TXT, 'w', encoding='utf-8') as f:
-            f.write("=" * 50 + "\n")
-            f.write("演讲稿文本\n")
-            f.write("=" * 50 + "\n\n")
-            f.write(script_content)
-        print(f"已生成: {SCRIPT_TXT}")
+    # 0. 如果演讲稿文本.txt不存在，从timestamps.txt生成
+    if not os.path.exists(txt_file_path):
+        print(f"演讲稿文本.txt 不存在，正在从 timestamps.txt 生成...")
+        # 从时间戳提取纯文本
+        raw_text_from_ts = "".join(timestamps_chars)
+        with open(txt_file_path, "w", encoding="utf-8") as f:
+            f.write(raw_text_from_ts)
+        print(f"已生成: {txt_file_path} ({len(raw_text_from_ts)} 字)")
+        raw_text_clean = raw_text_from_ts
+    else:
+        # 2. 读取演讲稿文本
+        with open(txt_file_path, "r", encoding="utf-8") as f:
+            raw_text = f.read()
 
-    # 执行第一阶段
-    instruction_ranges = phase1_process(TIMESTAMPS_TXT, SCRIPT_TXT, output_prefix='1')
+        # 清理演讲稿文本（去除标题栏等）
+        raw_text_clean = raw_text.split("==================================================")[-1].strip()
 
-    print("\n" + "=" * 50)
-    print("第一阶段完成！")
-    print(f"共识别 {len(instruction_ranges)} 个剪辑指令")
-    print("=" * 50)
+    # 验证
+    print(f"\n演讲稿文本长度: {len(raw_text_clean)}")
+    print(f"时间戳字符数: {len(timestamps_chars)}")
+
+    # 3. 调用 GPT 处理
+    print("\n正在调用 GPT 处理...")
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": raw_text_clean}
+        ],
+    )
+
+    cleaned_text = response.choices[0].message.content.strip()
+    cleaned_chars = list(cleaned_text)
+    print(f"\nGPT清理后字符数: {len(cleaned_chars)}")
+
+    if cleaned_text == raw_text_clean:
+        print("无需删减，文本相同")
+        save_output_files(cleaned_text, timestamp_lines)
+        return
+
+    # 4. 滑动窗口匹配
+    print("\n正在进行滑动窗口匹配...")
+    kept_indices = sliding_window_match(cleaned_chars, timestamps_chars)
+    print(f"保留的字符数: {len(kept_indices)}")
+
+    # 5. 重新构建时间戳行
+    cleaned_timestamps = build_cleaned_timestamp_lines(kept_indices, char_to_line, timestamp_lines)
+    print(f"保留的时间戳行数: {len(cleaned_timestamps)}")
+
+    # 6. 验证
+    reconstructed = ""
+    for line in cleaned_timestamps:
+        content = line.split("] ", 1)[1]
+        reconstructed += content
+
+    print(f"\n重建文本长度: {len(reconstructed)}")
+    print(f"GPT清理文本长度: {len(cleaned_text)}")
+
+    if reconstructed == cleaned_text:
+        print("✓ 匹配成功！")
+    else:
+        print("✗ 匹配失败，显示差异:")
+        for idx, (c1, c2) in enumerate(zip(reconstructed, cleaned_text)):
+            if c1 != c2:
+                print(f"  位置 {idx}: 重建='{c1}', GPT='{c2}'")
+                print(f"  前后各5字: 重建='{reconstructed[max(0,idx-5):idx+5]}', GPT='{cleaned_text[max(0,idx-5):idx+5]}'")
+                break
+
+    # 7. 保存输出
+    save_output_files(cleaned_text, cleaned_timestamps)
+
+    print("\n处理完成！")
 
 
 if __name__ == "__main__":
