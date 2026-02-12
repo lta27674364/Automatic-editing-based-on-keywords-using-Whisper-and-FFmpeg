@@ -1,9 +1,9 @@
 import os
 from openai import OpenAI
 
-os.environ["OPENAI_API_KEY"] = "sk-PPuZAgTDe40Ek9Yy34D010EcDb6f4760A6Bc4bDc3628B09b"
+os.environ["OPENAI_API_KEY"] = "sk-*************************************"
 client = OpenAI(
-    base_url="https://chat.9000aigc.com/v1"
+    base_url="https://*****************/v1"
 )
 
 # 你的剪辑规则提示词
